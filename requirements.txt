@@ -1,0 +1,9 @@
+
+1. Scikit-learn
+2. Pandas
+3. NumPy
+4. matplotlib
+5. Seaborn
+6. Petrolib
+7. Lasio
+8. Joblib

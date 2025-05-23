@@ -1,0 +1,820 @@
+---
+title: "Sonic Log Prediction"
+date: "April 16 2019"
+output: 
+  pdf_document: default
+  fig_caption: yes
+    theme: readable
+    toc: yes
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+list.of.packages <- c("caret","tidyverse","ggthemes","tidytext","tidyr","foreach","parallel","doParallel","Cubist","xgboost","e1071","randomForest","corrplot","car") #Specify the list of packages required for your project
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]  #Check for the packages that are NOT installed in the system
+
+if(length(new.packages)) install.packages(new.packages)   #Install the packages NOT installed in the system
+
+```
+
+
+```{r LoadLibrary}
+library(caret)
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(corrplot)
+library(car)
+library(e1071)
+library(earth)
+library(Cubist)
+library(xgboost)
+library(parallel)
+library(doParallel)
+library(dplyr)
+library(MLmetrics)
+library(randomForest)
+```
+
+Read in the dataframe and confirm there are no missing variables
+```{r ReadData}
+las <- read.csv("las_df.csv")
+las <- las[,-1]
+head(las)
+dim(las)
+summary(las)
+any(is.na(las))
+```
+
+Check the correlation of features in the dataframe
+```{r EDA:Correlation}
+cor(las)
+corrplot::corrplot(cor(las), method = "ellipse")
+```
+
+Based on reading petroleum engineering log literature the following logs will be dropped:
+CALI & TENS are tool calibration and tension logs
+DRHO, XPHI, SPHI, DPHI, NDSN, FDSN, ITTT are calculated from the recorded logs
+MSFL and LLS are resistivity logs but LLD will be used since it records resisitivity in an uninvaded formation 
+AHVT measures the volume of the well where cement is to be poured
+GRTO, GRTH , GRKT, and GKUT because GKUT and GRTO measure the same thing and GKUT is not available in a lot of logs 
+
+In the correlation plot some have some strong correlation and others dont.
+
+The variable to be predicted is MDT - mono delta t
+
+
+Drop Variables and Plot Correlation
+```{r EDA:Correlation2}
+las_df <- las
+las_df[c("CALI","AHVT","DRHO","XPHI","NDSN","FDSN","TENS","SPHI","ITTT","DPHI","DXDT","DYDT","MSFL","LLS", "GRTO","GRKT","GRTH","GKUT")] <- NULL
+cor(las_df)
+corrplot::corrplot(cor(las_df), method = "ellipse")
+```
+
+
+Plot relationship between Sonic log (MDT) and the other features
+```{r EDA:PlotRelationships}
+#plot the the relationships between features and MDT
+for (i in colnames(las_df)){
+  plot(las_df[,i],las_df$MDT,xlab = i,ylab = "MDT", main = paste("Relationship between MDT and ", i))
+}
+```
+My layman knowledge expects that there should be some relationship between what is recorded and the depth as geological formation changes as you go deeper in the earth. The plot between depth and sonic negates this. I included depth because rocks should be different as you go deeper. Will still leave depth and use it as a proxy for rock formation in the earth
+
+
+Plot pairwise relationship
+```{r EDA:PlotRelationships}
+#plot relationship between the features
+ pairs(las_df,upper.panel = NULL)
+```
+
+Plot feature distribution
+```{r EDA:PlotDistribution}
+#plot the distribution of the features
+for (i in colnames(las_df)){
+  hist(las_df[,i],xlab = i,main=paste("Distribution of", i))
+}
+```
+Most of the variables are skewed
+
+
+```{r EDA:Skewness}
+#check skewness of features
+apply(las_df,2,skewness)
+```
+From logging literature, sometimes outliers occur because of washout during the logging process. 
+
+
+Perform Data Scaling and Normalization utilizing minmax scaling - prior to choosing minmax scaling I tested using centering and scaling and chose using the skewness of the variables
+```{r Normalization}
+
+set.seed(123)
+
+xtr <- select(las_df, -MDT)
+y_train <- las_df$MDT
+
+#apply minmax scaling
+max_trn <- apply(xtr,2,max)
+min_trn <- apply(xtr,2,min)
+xtr_minmax <- as.data.frame(scale(xtr,center=min_trn,scale=max_trn-min_trn))
+
+#expoTrans
+xtr2 <- select(xtr_minmax,-DEPT,-POTA)
+x_trn <- preProcess(xtr2, method = c("expoTrans"))
+xtr3 <- predict(x_trn,xtr2)
+
+x_train <- cbind(xtr3,xtr_minmax[,c("DEPT","POTA")])
+
+apply(x_train,2,skewness)
+
+```
+
+
+Modelling
+
+
+Setup Train Control
+```{r Modelling:TrainControl}
+tr <- trainControl(method = "repeatedcv", repeats =5,
+                          number = 10, allowParallel = TRUE)
+```
+
+
+Linear Regression
+```{r Modelling:LinearRegression}
+set.seed(123)
+lm1 <- train(x_train,y_train, method = 'lm',
+               trControl = tr)
+
+lm1
+summary(lm1)
+lm1$results
+
+xyplot(y_train~predict(lm1),type=c("p","g"),xlab="Predicted",ylab="Actual")
+xyplot(resid(lm1)~predict(lm1),type=c("p","g"),xlab="Predicted",ylab="Error")
+hist(resid(lm1),main=paste("Histogram of Residuals"))
+y_lm1 <- predict(lm1,x_train)
+boxplot(y_train,y_lm1,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"))
+plotmo(lm1)
+MAPE(y_lm1,y_train)
+
+```
+
+There is a missing linear relationship as can be seen from the residual plot
+Residual plot shows the effect of multicollinearity - will go ahead to build the models
+
+```{r Modelling:ElasticNet}
+set.seed(123)
+enetReg <- train(x_train,y_train, method = 'glmnet',
+            tuneGrid = expand.grid(alpha = seq(0, 1, length = 10), 
+                                  lambda = seq(0.0001, 0.1, length = 10)),
+               trControl = tr)
+
+
+  # check results
+enetReg$bestTune
+plot(enetReg)  # alpha is the mixing parameter and lambda is the regularization parameter
+enetReg
+plot(enetReg$finalModel, xvar = 'lambda', lwd =1.4, label=TRUE)
+plot(varImp(enetReg, scale = FALSE))
+
+y_enetReg <- predict(enetReg,x_train) 
+boxplot(y_train,y_enetReg,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"))
+xyplot(y_train~predict(enetReg),type=c("p","g"),xlab="Predicted",ylab="Actual",main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+
+hist(resid(enetReg),main=paste("Histogram of Residuals"))
+xyplot(resid(enetReg)~predict(enetReg),type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+plotmo(enetReg,caption = ("Plot of Model Response To A Predictor"))
+MAPE(y_enetReg,y_train)
+
+```
+The final model is a ridge regression. The RMSE and MAE are not better than the linear model
+
+
+Partial Least Squares
+
+```{r Modelling:PartialLeastSquares}
+#Because the variables are collinear PLS is a method that will be able to explain predictor -response variance
+set.seed(123)
+plsReg <- train(x_train,y_train, method = 'pls',
+             tuneLength = 20,
+              trControl = tr)
+
+
+plsReg
+summary(plsReg)
+plot(plsReg)
+plot(varImp(plsReg, scale = FALSE))
+
+y_plsReg <- predict(plsReg,x_train)
+
+boxplot(y_train,y_plsReg,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train~y_plsReg,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(plsReg),main=paste("Histogram of Residuals"))
+xyplot(resid(plsReg)~y_plsReg,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+
+plotmo(plsReg,caption = ("Plot of Model Response To A Predictor"))
+MAPE(y_plsReg,y_train)
+```
+
+
+
+```{r Modelling:MARS}
+
+set.seed(123)
+marsReg <- train(x_train,y_train, method = 'earth',
+            tuneLength = 20,
+              trControl = tr)
+
+
+summary(marsReg)
+plot(marsReg)
+plot(varImp(marsReg, scale = FALSE))
+
+
+y_marsReg <- predict(marsReg,x_train)
+
+boxplot(y_train,y_marsReg,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train~y_marsReg,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(marsReg),main=paste("Histogram of Residuals"))
+xyplot(resid(marsReg)~y_marsReg,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+
+plotmo(marsReg,caption = ("Plot of Model Response To A Predictor"))
+MAPE(y_marsReg,y_train)
+```
+
+
+
+Ensemble Models
+
+
+Setup Parallel Processing
+
+```{r EnsembleModel:SetupCluster}
+
+cluster <- makeCluster(detectCores() - 2) # convention to leave 2 core for OS
+registerDoParallel(cluster)
+```
+
+```{r EnsembleModel:SetupParallelProcessing}
+tr <- trainControl(method = "cv", 
+                          number = 10, allowParallel = TRUE)
+```
+
+
+Cubist Model
+```{r}
+set.seed(123)
+
+cubmdl <- train(x_train,y_train, method = 'cubist',
+                    trControl = tr)
+
+cubmdl$bestTune
+plot(cubmdl)
+cubmdl
+
+y_cubmdl <- predict(cubmdl,x_train)
+
+boxplot(y_train,y_cubmdl,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train~y_cubmdl,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(cubmdl),main=paste("Histogram of Residuals"))
+xyplot(resid(cubmdl)~y_cubmdl,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+MAPE(y_cubmdl,y_train)
+```
+
+
+
+
+Bagged Mars
+```{r EnsembleModel:BaggedMARS}
+set.seed(123)
+mrsGrid <- expand.grid(degree = 1:5)
+mrsmdl <- train(x_train,y_train, method = 'bagEarthGCV',
+             tuneGrid = mrsGrid,
+              trControl = tr)
+
+mrsmdl$bestTune
+mrsmdl
+plot(mrsmdl)
+y_mrsmdl <- predict(mrsmdl,x_train)
+
+boxplot(y_train,y_mrsmdl,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train~y_mrsmdl,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(mrsmdl),main=paste("Histogram of Residuals"))
+xyplot(resid(mrsmdl)~y_mrsmdl,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+MAPE(y_mrsmdl,y_train)
+
+```
+
+
+Extreme Gradient Boosted Linear Model
+```{r EnsembleModelling:XGBoostLinear}
+
+set.seed(123)
+xgbGrid <- expand.grid(nrounds = c(100,200),
+                       eta=c(0.01,0.1,0.3),
+                       lambda = seq(0.1,1,5),
+                       alpha = seq(0,0.01,0.1)
+                      )
+xgblinear <- train(x_train,y_train, method = 'xgbLinear',
+             tuneGrid = xgbGrid,
+              trControl = tr)
+
+xgblinear$bestTune
+
+y_xlinear <- predict(xgblinear,x_train)
+
+boxplot(y_train,y_xlinear,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train~y_xlinear,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(xgblinear),main=paste("Histogram of Residuals"))
+xyplot(resid(xgblinear)~y_plsReg,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+MAPE(y_xlinear,y_train)
+
+```
+
+```{r trainControl , results='hide'}
+
+xgbGrid <- expand.grid(nrounds = c(100,200),
+                       eta=c(0.01,0.1,0.3),
+                       max_depth = 2:10,
+                       gamma=c(0,0.5,1),
+                       subsample = c(0.5,0.8,1),
+                       colsample_bytree = c(0.5,0.8,1),
+                       min_child_weight = 1
+                      )
+xgbtree <- train(x_train,y_train, method = 'xgbTree',
+             tuneGrid = xgbGrid,
+              trControl = tr)
+
+xgbtree$bestTune
+
+y_tree <- predict(xgbtree,x_train)
+
+plot(varImp(xgbtree, scale = FALSE))
+hist(resid(xgbtree))
+boxplot(predict(xgbtree),y_train)
+xyplot(y_train~predict(xgbtree),type=c("p","g"),xlab="Predicted",ylab="Actual")
+xyplot(resid(xgbtree)~predict(xgbtree),type=c("p","g"),xlab="Predicted",ylab="Error")
+MAPE(y_tree,y_train)
+```
+
+Stop Cluster
+```{r StopCluster}
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+Results
+```{r ModelStats}
+postResample(pred=y_lm1, obs=y_train)
+postResample(pred=y_enetReg, obs=y_train)
+postResample(pred=y_plsReg, obs=y_train)
+postResample(pred=y_marsReg, obs=y_train)
+postResample(pred=y_xlinear, obs=y_train)
+postResample(pred=y_cubmdl, obs=y_train)
+postResample(pred=y_mrsmdl, obs=y_train)
+y_xgbtree <- predict(xgbtree,x_train)
+postResample(pred=y_xgbtree, obs=y_train)
+
+MAPE(y_tree,y_train)
+
+```
+
+
+Test with oil well in the same block
+```{r TestModel}
+las_df2 <- read.csv("las_df2.csv")
+las_df2 <- las_df2[,-1]
+head(las_df2)
+
+colnames(las_df2)[colnames(las_df2)=="MNDT"] <- "MDT"
+colnames(las_df2)[colnames(las_df2)=="GAMMAKT"] <- "GRKT"
+
+x <- select(las_df2,DEPT,POTA,LLD,RHOB,PE,NPHI,GR,URAN,THOR,BHVT)
+y_test <- las_df2$MDT
+
+max_tst <- apply(x,2,max)
+min_tst <- apply(x,2,min)
+x_tst_minmax <- as.data.frame(scale(x,center=min_tst,scale=max_tst-min_tst))
+
+x_test1 <- select(x_tst_minmax,-DEPT,-POTA)
+x_tst <- preProcess(x_test1, method = c("expoTrans"))
+x_tst_et <- predict(x_tst,x_test1)
+
+x_test <- cbind(x_tst_et,x_tst_minmax[,c("DEPT","POTA")])
+
+pred_names <- colnames(x_train)
+
+lm_test <- as.data.frame(predict(lm1,x_test), col.names="predicted_MDT")
+enet_test <- as.data.frame(predict(enetReg,x_test), col.names="predicted_MDT")
+pls_test <- as.data.frame(predict(plsReg,x_test), col.names="predicted_MDT")
+mars_test <- as.data.frame(predict(marsReg,x_test), col.names="predicted_MDT")
+cubist_test <- as.data.frame(predict(cubmdl,x_test), col.names="predicted_MDT")
+bmars_test <- as.data.frame(predict(mrsmdl,x_test), col.names="predicted_MDT")
+xgbl_test <- as.data.frame(predict(xgblinear,x_test[,pred_names]), col.names="predicted_MDT")
+xgbtree_test <- as.data.frame(predict(xgbtree,x_test[,pred_names]), col.names="predicted_MDT")
+
+postResample(pred=lm_test, obs=y_test)
+postResample(pred=enet_test, obs=y_test)
+postResample(pred=pls_test, obs=y_test)
+postResample(pred=mars_test, obs=y_test)
+postResample(pred=cubist_test, obs=y_test)
+postResample(pred=bmars_test, obs=y_test)
+postResample(pred=xgbl_test, obs=y_test)
+postResample(pred=xgbtree_test, obs=y_test)
+
+
+lm_test <- predict(lm1,x_test)
+enet_test <- predict(enetReg,x_test)
+pls_test <- predict(plsReg,x_test)
+mars_test <- predict(marsReg,x_test)
+cubist_test <- predict(cubmdl,x_test)
+bmars_test <- predict(mrsmdl,x_test)
+xgbl_test <- predict(xgblinear,x_test[,pred_names])
+xgbtree_test <- predict(xgbtree,x_test[,pred_names])
+
+MAPE(y_lm, y_test)
+MAPE(enet_test,y_test)
+MAPE(pls_test,y_test)
+MAPE(mars_test,y_test)
+MAPE(cubist_test,y_test)
+MAPE(bmars_test,y_test)
+MAPE(xgbl_test, y_test)
+MAPE(xgbtree_test,y_test)
+```
+
+
+
+
+```{r}
+las_df2 <- read.csv("las_df2.csv")
+las_df2 <- las_df2[,-1]
+head(las_df2)
+
+colnames(las_df2)[colnames(las_df2)=="MNDT"] <- "MDT"
+colnames(las_df2)[colnames(las_df2)=="GAMMAKT"] <- "GRKT"
+
+x <- select(las_df2,DEPT,POTA,LLD,RHOB,PE,NPHI,GR,URAN,THOR,BHVT)
+y_test <- select(las_df2,MDT)
+
+max_tst <- apply(x,2,max)
+min_tst <- apply(x,2,min)
+x_tst_minmax <- as.data.frame(scale(x,center=min_tst,scale=max_tst-min_tst))
+
+x_test1 <- select(x_tst_minmax,-DEPT,-POTA)
+x_tst <- preProcess(x_test1, method = c("expoTrans"))
+x_tst_et <- predict(x_tst,x_test1)
+
+x_test <- cbind(x_tst_et,x_tst_minmax[,c("DEPT","POTA")])
+
+pred_names <- colnames(x_train)
+xgbtree_test <- as.data.frame(predict(xgbtree,x_test[,pred_names]), col.names="predicted_MDT")
+postResample(pred=xgbtree_test, obs=y_test)
+```
+
+
+The results appear to be affected largely by outliers remove outliers and remodel and test
+
+Model without Outliers
+
+Determine records with outliers - 
+Outliers in sonic log data sometimes are caused by well washout
+```{r DetermineOutliers}
+xy_train <- cbind(x_train,y_train)
+mod <- lm(y_train ~ .,data=xy_train)
+cooksd <- cooks.distance(mod)
+
+plot(cooksd, pch="*", cex=2, main="Influential Obs by Cooks distance")  # plot cook's distance
+abline(h = 4*mean(cooksd, na.rm=T), col="red")  # add cutoff line
+text(x=1:length(cooksd)+1, y=cooksd, labels=ifelse(cooksd>4*mean(cooksd, na.rm=T),names(cooksd),""), col="red") 
+```
+
+
+```{r Outliers:RemoveOutliers}
+influential <- as.numeric(names(cooksd)[(cooksd > 4*mean(cooksd, na.rm=T))]) 
+outlier_train <- xy_train[influential,]
+xy_train1 <- xy_train[-influential,]
+```
+
+
+```{r EDA:Outliers}
+head(outlier_train)
+summary(outlier_train)
+pairs(outlier_train)
+```
+
+Rerun models without outliers
+
+```{r ModelNoOutliers}
+x_train2 <- select(xy_train1,-y_train)
+y_train2 <- xy_train1$y_train
+```
+
+
+Linear Regression
+```{r ModelNoOutliers:LinearRegression}
+set.seed(123)
+lm2 <- train(x_train2,y_train2, method = 'lm',
+               trControl = tr)
+
+lm2
+summary(lm2)
+lm2$results
+
+xyplot(y_train2~predict(lm2),type=c("p","g"),xlab="Predicted",ylab="Actual")
+xyplot(resid(lm2)~predict(lm2),type=c("p","g"),xlab="Predicted",ylab="Error")
+hist(resid(lm2),main=paste("Histogram of Residuals"))
+y_lm2 <- predict(lm2,x_train)
+boxplot(y_train2,y_lm2,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"))
+plotmo(lm2)
+
+```
+
+
+
+```{r ModelNoOutliers:ElasticNet}
+set.seed(123)
+enetReg2 <- train(x_train2,y_train2, method = 'glmnet',
+            tuneGrid = expand.grid(alpha = seq(0, 1, length = 10), 
+                                  lambda = seq(0.0001, 0.1, length = 10)),
+               trControl = tr)
+
+
+  # check results
+enetReg2$bestTune
+plot(enetReg2)  # alpha is the mixing parameter and lambda is the regularization parameter
+enetReg2
+plot(enetReg2$finalModel, xvar = 'lambda', lwd =1.4, label=TRUE)
+plot(varImp(enetReg2, scale = FALSE))
+
+y_enetReg2 <- predict(enetReg2,x_train2) 
+boxplot(y_train2,y_enetReg2,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"))
+xyplot(y_train2~predict(enetReg2),type=c("p","g"),xlab="Predicted",ylab="Actual",main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+
+hist(resid(enetReg2),main=paste("Histogram of Residuals"))
+xyplot(resid(enetReg2)~predict(enetReg2),type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+plotmo(enetReg2,caption = ("Plot of Model Response To A Predictor"))
+
+```
+
+
+Partial Least Squares
+```{r ModelNoOutliers:PartialLeastSquares}
+#Because the variables are collinear PLS is a method that will be able to explain predictor -response variance
+set.seed(123)
+plsReg2 <- train(x_train2,y_train2, method = 'pls',
+             tuneLength = 20,
+              trControl = tr)
+
+
+plsReg2
+summary(plsReg2)
+plot(plsReg2)
+plot(varImp(plsReg2, scale = FALSE))
+
+y_plsReg2 <- predict(plsReg2,x_train2)
+
+boxplot(y_train2,y_plsReg2,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train2~y_plsReg2,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(plsReg2),main=paste("Histogram of Residuals"))
+xyplot(resid(plsReg2)~y_plsReg2,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+
+plotmo(plsReg2,caption = ("Plot of Model Response To A Predictor"))
+
+```
+
+
+
+```{r ModelNoOutliers:MARS}
+
+set.seed(123)
+marsReg2 <- train(x_train2,y_train2, method = 'earth',
+            tuneLength = 20,
+              trControl = tr)
+
+
+summary(marsReg2)
+plot(marsReg2)
+plot(varImp(marsReg2, scale = FALSE))
+
+
+y_marsReg2 <- predict(marsReg2,x_train2)
+
+boxplot(y_train2,y_marsReg2,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train2~y_marsReg2,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(marsReg2),main=paste("Histogram of Residuals"))
+xyplot(resid(marsReg2)~y_marsReg2,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+
+plotmo(marsReg2,caption = ("Plot of Model Response To A Predictor"))
+
+```
+
+
+
+Ensemble Models
+
+
+Setup Parallel Processing
+
+```{r ModelNoOutliers:SetupCluster}
+
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+```
+
+```{r ModelNoOutliers:TrainControl}
+tr <- trainControl(method = "cv", 
+                          number = 10, allowParallel = TRUE)
+```
+
+
+Cubist Model
+```{r ModelNoOutliers:Cubist}
+set.seed(123)
+
+cubmdl2 <- train(x_train2,y_train2, method = 'cubist',
+                    trControl = tr)
+
+cubmdl2$bestTune
+plot(cubmdl2)
+cubmdl2
+
+y_cubmdl2 <- predict(cubmdl2,x_train2)
+
+boxplot(y_train2,y_cubmdl2,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train2~y_cubmdl2,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(cubmdl2),main=paste("Histogram of Residuals"))
+xyplot(resid(cubmdl2)~y_cubmdl2,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+```
+
+
+
+Bagged Mars
+```{r ModelNoOutliers:BaggedMars}
+set.seed(123)
+mrsGrid <- expand.grid(degree = 1:5)
+mrsmdl2 <- train(x_train2,y_train2, method = 'bagEarthGCV',
+             tuneGrid = mrsGrid,
+              trControl = tr)
+
+mrsmdl2$bestTune
+mrsmdl2
+plot(mrsmdl2)
+y_mrsmdl2 <- predict(mrsmdl2,x_train2)
+
+boxplot(y_train2,y_mrsmdl2,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train2~y_mrsmdl2,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(mrsmdl2),main=paste("Histogram of Residuals"))
+xyplot(resid(mrsmdl2)~y_mrsmdl2,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+
+```
+
+
+
+Extreme Gradient Boosted Linear Model
+```{r ModelNoOutliers:XGBoostLinear }
+
+set.seed(123)
+xgbGrid <- expand.grid(nrounds = c(100,200),
+                       eta=c(0.01,0.1,0.3),
+                       lambda = seq(0.1,1,5),
+                       alpha = seq(0,0.01,0.1)
+                      )
+xgblinear2 <- train(x_train2,y_train2, method = 'xgbLinear',
+             tuneGrid = xgbGrid,
+              trControl = tr)
+
+xgblinear2$bestTune
+
+y_xlinear2 <- predict(xgblinear2,x_train2)
+
+boxplot(y_train2,y_xlinear2,names=c("Actual","Predicted"),main=paste("Distribution of Actual MDT versus Predicted MDT"),main=paste("ScatterPlot Actual MDT versus Predicted MDT"))
+xyplot(y_train2~y_xlinear2,type=c("p","g"),xlab="Predicted",ylab="Actual")
+
+hist(resid(xgblinear2),main=paste("Histogram of Residuals"))
+xyplot(resid(xgblinear2)~y_plsReg2,type=c("p","g"),xlab="Predicted",ylab="Error",main=paste("Scatterplot of Residual versus Predicted MDT"))
+```
+
+
+```{r trainControl , results='hide'}
+
+xgbGrid <- expand.grid(nrounds = c(100,200),
+                       eta=c(0.01,0.1,0.3),
+                       max_depth = 2:10,
+                       gamma=c(0,0.5,1),
+                       subsample = c(0.5,0.8,1),
+                       colsample_bytree = c(0.5,0.8,1),
+                       min_child_weight = 1
+                      )
+xgbtree <- train(x_train2,y_train2, method = 'xgbTree',
+             tuneGrid = xgbGrid,
+              trControl = tr)
+
+xgbtree$bestTune
+
+y_xgbtree2 <- predict(xgbtree,x_train2)
+plot(varImp(xgbtree, scale = FALSE))
+hist(resid(xgbtree))
+boxplot(predict(xgbtree),y_train2)
+xyplot(y_train2~predict(xgbtree),type=c("p","g"),xlab="Predicted",ylab="Actual")
+xyplot(resid(xgbtree)~predict(xgbtree),type=c("p","g"),xlab="Predicted",ylab="Error")
+```
+
+
+Stop Cluster
+```{r ModelNoOutliers:StopCluster}
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+Results
+```{r ModelNoOutliers:Result}
+postResample(pred=y_lm2, obs=y_train2)
+postResample(pred=y_enetReg2, obs=y_train2)
+postResample(pred=y_plsReg2, obs=y_train2)
+postResample(pred=y_marsReg2, obs=y_train2)
+postResample(pred=y_xlinear2, obs=y_train2)
+postResample(pred=y_cubmdl2, obs=y_train2)
+postResample(pred=y_mrsmdl2, obs=y_train2)
+postResample(pred=y_xgbtree2, obs=y_train2)
+```
+
+
+Test with oil well in the same block with outliers
+```{r TestOutliers}
+
+lm_test <- as.data.frame(predict(lm2,x_test), col.names="predicted_MDT")
+enet_test <- as.data.frame(predict(enetReg2,x_test), col.names="predicted_MDT")
+pls_test <- as.data.frame(predict(plsReg2,x_test), col.names="predicted_MDT")
+mars_test <- as.data.frame(predict(marsReg2,x_test), col.names="predicted_MDT")
+cubist_test <- as.data.frame(predict(cubmdl2,x_test), col.names="predicted_MDT")
+bmars_test <- as.data.frame(predict(mrsmdl2,x_test), col.names="predicted_MDT")
+pred_names <- colnames(x_train2)
+xgbl_test <- as.data.frame(predict(xgblinear,x_test[,pred_names]), col.names="predicted_MDT")
+xgbt_test <- as.data.frame(predict(xgbtree,x_test[,pred_names]), col.names="predicted_MDT")
+
+postResample(pred=lm_test, obs=y_test)
+postResample(pred=enet_test, obs=y_test)
+postResample(pred=pls_test, obs=y_test)
+postResample(pred=mars_test, obs=y_test)
+postResample(pred=cubist_test, obs=y_test)
+postResample(pred=bmars_test, obs=y_test)
+postResample(pred=xgbl_test, obs=y_test)
+postResample(pred=xgbt_test, obs=y_test)
+```
+
+
+Test with oil well without outliers
+```{r TestNoOutliers:Remove Outliers}
+xy_test <- cbind(x_test,y_test)
+mod <- lm(MDT ~ .,data=xy_test)
+cooksd <- cooks.distance(mod)
+
+influential <- as.numeric(names(cooksd)[(cooksd > 4*mean(cooksd, na.rm=T))]) 
+xy_test1 <- xy_test[-influential,]
+```
+
+
+```{r TestNoOutliers:Test}
+x_test1 <- select(xy_test1,-MDT)
+y_test1 <- xy_test1$MDT
+
+lm_test1 <- as.data.frame(predict(lm2,x_test1), col.names="predicted_MDT")
+enet_test1 <- as.data.frame(predict(enetReg2,x_test1), col.names="predicted_MDT")
+pls_test1 <- as.data.frame(predict(plsReg2,x_test1), col.names="predicted_MDT")
+mars_test1 <- as.data.frame(predict(marsReg2,x_test1), col.names="predicted_MDT")
+cubist_test1 <- as.data.frame(predict(cubmdl2,x_test1), col.names="predicted_MDT")
+bmars_test1 <- as.data.frame(predict(mrsmdl2,x_test1), col.names="predicted_MDT")
+pred_names <- colnames(x_train2)
+xgbl_test1 <- as.data.frame(predict(xgblinear,x_test1[,pred_names]), col.names="predicted_MDT")
+xgbt_test1 <- as.data.frame(predict(xgbtree,x_test1[,pred_names]), col.names="predicted_MDT")
+
+postResample(pred=lm_test1, obs=y_test1)
+postResample(pred=enet_test1, obs=y_test1)
+postResample(pred=pls_test1, obs=y_test1)
+postResample(pred=mars_test1, obs=y_test1)
+postResample(pred=cubist_test1, obs=y_test1)
+postResample(pred=bmars_test1, obs=y_test1)
+postResample(pred=xgbl_test1, obs=y_test1)
+postResample(pred=xgbt_test1, obs=y_test1)
+```
+
+
+
+
+
+

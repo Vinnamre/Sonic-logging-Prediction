@@ -1,0 +1,447 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.4.2
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+```{python}
+# %autosave 0
+```
+
+# Introduction
+
+
+This project explores predicting sonic logs (MDT) for a given oil well based on already logged data. The primary aim was to determine how accurately logs from a well in given block could predict the sonic log for another well either in the same block or in a different block. Based on the function of sonic logs in well logging, the following logs – Potassium (POTA), GammaRay(GR), NeutronPorosity(NPHI),   Resistivity (LLD), Density(RHOB), Uranium (URAN), Thromium(TH)   were used to build 8 models – Linear Regression, Partial Least Squares, Extreme Gradient Boosted Trees, Extreme Gradient Boosted Linear Models
+Of the models the Extreme Gradient Boosted Trees performed the best on the same well RMSE is 2.7 and on a different well in a different block was 8.17
+
+
+## Methodology
+
+
+The process builds models from oilwell log located in the Midland Basin - Block 5, Section 35.
+First exploratory data analysis was carried out, the machine learning models where then built using cross validation. To test another oilwell log from Block 5, section 16 was used to test.
+Next outliers where taken out, models where rebuilt again and tested, this both with outliers and without outliers in the test dataset.
+
+
+# Data Preparation
+
+
+Python has a well developed library LASIO for reading the well log (.las) files. The LASIO library was used to extract the logs into a pandas dataframe that could then be explored and utilized for model building. 
+The same process is used for the test dataframe
+
+```{python}
+import lasio as la
+import numpy as np
+import pandas as pd
+```
+
+### View the log description
+
+```{python}
+las = la.read(r'4200341370.las')
+print(las.curves)
+```
+
+```{python}
+las.params
+```
+
+```{python}
+train = pd.DataFrame(las.data, columns=list(las.curvesdict.keys()))
+
+#Drop missing values - sometimes the calibration tools malfunction and do not read the values
+train.dropna(axis=0,how='any',inplace=True)
+train.shape
+```
+
+### Import the data frame
+
+
+### Extract Second Well Log For Test
+
+```{python}
+las2 = la.read(r'4200340497.las')
+test = pd.DataFrame(las2.data, columns=list(las.curvesdict.keys()))
+test.dropna(axis=0,how='any',inplace=True)
+test.shape
+```
+
+## Exploratory Data Analysis
+
+
+Based on petroleum engineering log literature the following logs will be dropped:\
+CALI & TENS are tool calibration (this will be dropped after confirmation that there is no washout) and tension logs\
+DRHO, XPHI, SPHI, DPHI, NDSN, FDSN, ITTT are calculated from the recorded logs\
+MSFL and LLS are resistivity logs but LLD will be used since it records resisitivity in an uninvaded formation \
+AHVT measures the volume of the well where cement is to be poured\
+GRTO, GRTH , GRKT, and GKUT are various gamma rays because GKUT and GRTO measure the same thing and GKUT is not available in a lot of logs\
+
+The variable to be predicted is MDT - mono delta t\
+Some of the variables like the resistivity logs have a very spread out distribution, for example LLD is heavily right skewed\
+
+
+### Checking Data For Washout
+
+Washout occurs when the rock formation is much wider than the hole originaly bored by the tool. An effect of washout is that the caliper tool reads data from mud or water. One way to confirm there is washout is to confirm that the caliper readings are not more than 1.5 times larger than what was set.
+From the summary below, it was determined that there was washout because the caliper had a maximum reading of 22.411600\
+
+```{python}
+# CALI - caliper log will be used to determine washout then dropped
+train.drop(columns = ['TENS','DRHO','XPHI','SPHI','DPHI','NDSN','FDSN','ITTT','MSFL','LLS','AHVT','GRTO','GRTH','GRKT','GKUT','DXDT','DYDT'], inplace=True)
+train.describe()
+```
+
+## Exploratory Analysis
+
+The train dataset will be utilized for analysis afterwhich it will be dropped.
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# %matplotlib inline
+sns.set()
+```
+
+###  Variable Distribution - Histograms
+
+
+#### Histograms For The Whole Data
+
+```{python}
+train.hist(bins=10,figsize=(15, 15), layout=(3, 4))
+plt.show()
+```
+
+```{python}
+names = train.columns
+fig, ax = plt.subplots(3, 4, figsize=(18, 15))
+for variable, subplot in zip(names, ax.flatten()):
+    sns.scatterplot(train['MDT'],train[variable], ax=subplot)
+    
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(20, 10))
+sns.heatmap(train.corr(),annot=True, fmt='0.2f', ax=ax);
+```
+
+
+Determining the relationship between the predictors and the Sonic log variable
+Well Depth and Volume dont appear to have linear relationship with the Sonic Log and because they are highly collinear Volume will be dropped because logic would dictate that values might change as depth increases.
+The univariate distribution of resistivity is heavily skewed, and so its relationship with Sonic Log is unclear. The relationship appears to be non-linear.
+The rest have a clear linear relationship: Postassim, Uranium, Thromuim, Gamma Ray and Neutron Porosity have a positive relationship and Density and Photo Electric logs have a negative linear relationship with Sonic Log
+
+Resistivity, uranium and gamma ray have skewed data and need to be transformed. First skewness will be tested, and all skewed features will be transformed utilizing Box-Cox transformation
+To ensure that no feature is more influential than another due to its values, min-max scaling will be utilized if necessary on features that where not previously Power transformed.
+
+
+### Skewness Test & Data Transformation
+
+The test for skewness on the complete data showed that Resitivity , Neutron Porosity, Uranium, Photoelectric, GammaRay,Thromium and RHOB all have skewness.\
+As such they need to be transformed for normality, NPHI has negative values and so a Yeo-Johnson transformation is performed, Box-Cox is utilized for the rest.\
+Also Depth has values that are extremely larger than all the other values and so Min-Max scaler is used to constrain the values to a range between 0 and 1.\
+Potassium is not transformed because it does not have noticable skew and the values are not excessively large.\
+
+
+```{python}
+from scipy.stats import skew
+train.drop(columns = 'BHVT', inplace=True)
+train.apply(lambda x: skew(x)).sort_values(ascending=False)
+```
+
+```{python}
+names = train.columns
+fig, ax = plt.subplots(3,4, figsize=(18, 15))
+for variable, subplot in zip(names, ax.flatten()):
+    b = sns.boxplot(train[variable], orient = "v", ax=subplot)
+```
+
+## Data Modelling
+
+
+Since outliers are suspected, observations were dropped using the difference between the observed caliper measurement in the logs and 7.88 which was the set measure for the caliper. '
+
+Three data sets with the following labels listed below will be created
+
+ * x_all & y_all - original dataset
+ * x_small & y_small - dataset with only caliper outliers dropped
+ * x_no_out & y_no_out - dataset outliers from all logs dropped
+
+Next the data is then split into the y variable MDT and the independent variables which is all the other variables.
+
+```{python}
+det = train.describe()
+
+iqr_dict = dict()
+for col in det.columns:
+    Q1 = det.loc['25%',col]
+    Q3 = det.loc['75%',col]
+    iqr = Q3 - Q1
+    low = Q1 - (1.5 * iqr)
+    up = Q3 + (1.5 * iqr)
+    iqr_dict.update({col:[low,up]})
+
+iqr_dict
+
+```
+
+```{python}
+#Get 25th and 75th Percentiles
+    
+#Function to drop outliers
+def drop_outliers(df,iqr_dict,col):
+    if col == 0:
+        df = df[(df['CALI'] >= iqr_dict['CALI'][0]) & (df['CALI'] <= iqr_dict['CALI'][1])]
+        return df
+    else:
+        for key in iqr_dict:
+            df = df[(df[key] >= iqr_dict[key][0]) & (df[key] <= iqr_dict[key][1])]
+        return df
+
+df_small = drop_outliers(train,iqr_dict,0)
+df_no_out = drop_outliers(train,iqr_dict,1)
+
+print("Shape of dataframe with caliper outliers removed:", df_small.shape)
+print("Shape of dataframe with all log outliers removed:", df_no_out.shape)
+```
+
+```{python}
+#Function To Drop Outliers and Split the Data
+def split_df(df):    
+    #Split the data
+    x_split = pd.DataFrame(df[['URAN', 'THOR', 'LLD', 'GR', 'RHOB', 'PE','NPHI','DEPT']])
+    y_split = df.loc[:,'MDT']
+    return x_split,y_split
+
+
+x_all, y_all = split_df(train)
+x_small, y_small = split_df(df_small)
+x_no_out, y_no_out = split_df(df_no_out)
+
+```
+
+Boxplots to veiw the effect of dropping observations
+
+```{python}
+from sklearn.compose import make_column_selector
+from sklearn.compose import make_column_transformer
+from sklearn.preprocessing import PowerTransformer
+from sklearn.preprocessing import MinMaxScaler
+
+#Box-Cox Transformation of Skewed Variables with Only Positive Values 
+col_trans = make_column_transformer(
+                                    (PowerTransformer(),['URAN', 'THOR', 'LLD', 'GR', 'RHOB', 'PE']),
+                                    (PowerTransformer(method='yeo-johnson'),['NPHI']),
+                                    (MinMaxScaler(),['DEPT'])
+                                    )
+x_all = col_trans.fit_transform(x_all)
+x_small = col_trans.fit_transform(x_small)
+x_no_out = col_trans.fit_transform(x_no_out)
+
+```
+
+```{python}
+fig, (ax1,ax2) = plt.subplots(1,2, sharex=True,sharey=True,figsize=(15, 5))
+ax1.set_title("Data With Caliper Outliers Removed",loc='center')
+ax1.boxplot(x_small);
+
+ax2.set_title("Data With All Outliers Removed",loc='center')
+ax2.boxplot(x_no_out);
+```
+
+### Modelling
+
+As seen above, the variables still have outliers as such the models utilized need to be robust to outliers
+The following models will be utilzed and compared using their mean absolute error:
+    * Simple Models: Linear Regression, Elastic Net
+    * Stacking: Linear Regression, Elastic Net and Random Forest
+    * Neural Network
+
+```{python active="", eval=FALSE}
+### Linear Regression
+
+This is the first choice of a baseline model to determine the relationship between the features and the sonic log. All the predictors have a significant relationship with the model.
+
+Since all the datasets have outliers, the cross validation result is compared betweeb datasets using the mean absolute error.
+```
+
+```{python}
+from sklearn.model_selection import cross_validate
+from sklearn.linear_model import LinearRegression
+from sklearn.base import clone
+
+lin_reg1 = LinearRegression()
+lin_reg2 = clone(lin_reg1)
+lin_reg3 = clone(lin_reg1)
+
+
+lin_reg_cv1 = cross_validate(lin_reg1, x_all, y_all, scoring='neg_mean_absolute_error',return_train_score=True, cv =5)
+lin_reg_cv2 = cross_validate(lin_reg2, x_small, y_small, scoring= 'neg_mean_absolute_error',return_train_score=True, cv =5)
+lin_reg_cv3 = cross_validate(lin_reg3, x_no_out, y_no_out, scoring='neg_mean_absolute_error',return_train_score=True, cv =5)
+
+report_table = [[lin_reg_cv1['train_score'].mean(),lin_reg_cv1['test_score'].mean()]]
+report_table = report_table + [[lin_reg_cv2['train_score'].mean() ,lin_reg_cv2['test_score'].mean()]]
+report_table = report_table + [[lin_reg_cv3['train_score'].mean(),lin_reg_cv3['test_score'].mean()]]
+
+report = pd.DataFrame(report_table,columns = ['LR_CV Train MAE',' LR_CV Test MAE'],index=['all data','no caliper outliers','no_outliers'])
+report
+```
+
+A comparison of error from this dataset would indicate that the x_no_out dataset (which is the dataset with outliers that have caliper difference +-1 ) is the better choice. Dropping the outliers has a positive impact on the results of the three datasets.
+Training will still be done with all and then a final choice will be made.
+
+
+### Lasso Regression
+
+The lasso 
+
+```{python}
+#from sklearn.linear_model import Lasso
+#from sklearn.model_selection import GridSearchCV
+#from sklearn.base import clone
+
+lasso = Lasso()
+
+alpha_range = list(np.linspace(0.01,0.1,20))
+param_grid = dict(alpha=alpha_range)
+
+lasso_reg1 = GridSearchCV(lasso,param_grid,scoring = 'neg_mean_absolute_error',refit=True,cv = 5,return_train_score= True ,verbose = 1)
+lasso_reg2 = clone(lasso_reg1)
+lasso_reg3 = clone(lasso_reg1)
+
+lasso_reg1.fit(x_all, y_all)
+results_lasso_all = pd.DataFrame(lasso_reg1.cv_results_)
+
+lasso_reg2.fit(x_small, y_small)
+results_lasso_small = pd.DataFrame(lasso_reg2.cv_results_)
+
+lasso_reg3.fit(x_no_out, y_no_out)
+results_lasso_no_out = pd.DataFrame(lasso_reg3.cv_results_)
+```
+
+```{python}
+#Plot scores
+
+def plot(ax,alpha_list, mean_train_score, mean_test_score):
+    ax.plot(alpha_list, mean_train_score, c = 'b')
+    ax.plot(alpha_list, mean_test_score, c = 'g')
+    ax.legend(loc = 1)
+    return
+
+fig, (ax1,ax2,ax3) = plt.subplots(1,3, figsize=(20, 5))
+plot(ax1,results_lasso_all.param_alpha, results_lasso_all.mean_train_score, results_lasso_all.mean_test_score)
+plot(ax2,results_lasso_small.param_alpha, results_lasso_small.mean_train_score, results_lasso_small.mean_test_score)
+plot(ax3,results_lasso_no_out.param_alpha, results_lasso_no_out.mean_train_score, results_lasso_no_out.mean_test_score)
+```
+
+```{python}
+from sklearn.inspection import plot_partial_de
+```
+
+```{python}
+results_lasso_no_out
+```
+
+### Random Forest Regression
+
+Tree models tend to be less affected by tree models as such the random forest is the next choice
+
+```{python}
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.base import clone
+
+param_grid = {
+     'max_features': ['auto','sqrt','log2'],
+     'n_estimators':[150,200,250,300],
+     'max_depth': [7,8,9,10,11]
+}
+
+rf_model = RandomForestRegressor(random_state=42)
+
+grid_model1 = GridSearchCV(rf_model,param_grid, scoring = 'neg_mean_absolute_error',refit=True,cv = 5,return_train_score= True ,verbose = 1)
+grid_model2 = clone(grid_model1)
+grid_model3 = clone(grid_model1)
+
+grid_model1.fit(x_all,y_all)
+grid_model2.fit(x_small,y_small)
+grid_model3.fit(x_no_out,y_no_out)
+
+```
+
+### Model Diagnostics
+
+Model residuals and checks for residuals to +
+
+
+```{python}
+x = list(np.linspace(0.01,0.1,20))
+x
+```
+
+```{python}
+y = list(np.geomspace(0.01,0.1,20))
+y
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+### Random Sample Consesus (RANSAC) Regressor
+
+
+
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+
+```
