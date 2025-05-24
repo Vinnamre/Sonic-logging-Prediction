@@ -1,10 +1,7 @@
-# 🛢️ Sonic Log Prediction Projects
+# 🛢️ Well log Analysis and Prediction using Machine learning
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
-![ML](https://img.shields.io/badge/Machine%20Learning-Ensemble%20&%20Standalone-orange)
 
-This repository hosts two machine learning projects focused on predicting sonic well logs from petrophysical data:
+This repository hosts machine learning project focused on analyzing and predicting sonic well logs from petrophysical data:
 
 - 🔍 **[Ensemble vs. Standalone Models](ensemble_vs_standalone/README.md)**  
   Comparison between ensemble methods (e.g., Random Forest, Gradient Boosting) and standalone regression models.
